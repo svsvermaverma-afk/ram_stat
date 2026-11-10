@@ -24,26 +24,29 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL,
             category TEXT,
+            price REAL DEFAULT 0,
             mrp REAL DEFAULT 0,
             selling_price REAL DEFAULT 0,
             stock INTEGER DEFAULT 0
         )
     """)
     
-    # Auto-Migration for columns
+    # Auto-Migration for older schemas
     c.execute("PRAGMA table_info(inventory)")
     cols = [column[1] for column in c.fetchall()]
     
     if "selling_price" not in cols:
+        c.execute("ALTER TABLE inventory ADD COLUMN selling_price REAL DEFAULT 0")
         if "price" in cols:
-            c.execute("ALTER TABLE inventory ADD COLUMN selling_price REAL DEFAULT 0")
             c.execute("UPDATE inventory SET selling_price = price")
-        else:
-            c.execute("ALTER TABLE inventory ADD COLUMN selling_price REAL DEFAULT 0")
             
     if "mrp" not in cols:
         c.execute("ALTER TABLE inventory ADD COLUMN mrp REAL DEFAULT 0")
         c.execute("UPDATE inventory SET mrp = selling_price")
+
+    if "price" not in cols:
+        c.execute("ALTER TABLE inventory ADD COLUMN price REAL DEFAULT 0")
+        c.execute("UPDATE inventory SET price = selling_price")
 
     # Sales Table
     c.execute("""
@@ -254,14 +257,15 @@ elif menu == "📦 Inventory (Add / Excel Upload)":
                     conn = get_connection()
                     c = conn.cursor()
                     c.execute("""
-                        INSERT INTO inventory (name, category, mrp, selling_price, stock)
-                        VALUES (?, ?, ?, ?, ?)
+                        INSERT INTO inventory (name, category, price, mrp, selling_price, stock)
+                        VALUES (?, ?, ?, ?, ?, ?)
                         ON CONFLICT(name) DO UPDATE SET
                             category = excluded.category,
+                            price = excluded.price,
                             mrp = excluded.mrp,
                             selling_price = excluded.selling_price,
                             stock = stock + excluded.stock
-                    """, (name, category, mrp, selling_price, stock))
+                    """, (name, category, selling_price, mrp, selling_price, stock))
                     conn.commit()
                     conn.close()
                     st.success(f"'{name}' successfully save ho gaya!")
@@ -314,15 +318,17 @@ elif menu == "📦 Inventory (Add / Excel Upload)":
                             sp_val = float(r["selling_price"])
                             stk_val = int(r["stock"])
 
+                            # Yahan 'price' me bhi sp_val pass kar diya taaki NOT NULL constraint pass ho sake
                             c.execute("""
-                                INSERT INTO inventory (name, category, mrp, selling_price, stock)
-                                VALUES (?, ?, ?, ?, ?)
+                                INSERT INTO inventory (name, category, price, mrp, selling_price, stock)
+                                VALUES (?, ?, ?, ?, ?, ?)
                                 ON CONFLICT(name) DO UPDATE SET
                                     category = excluded.category,
+                                    price = excluded.price,
                                     mrp = excluded.mrp,
                                     selling_price = excluded.selling_price,
                                     stock = stock + excluded.stock
-                            """, (item_name, cat, mrp_val, sp_val, stk_val))
+                            """, (item_name, cat, sp_val, mrp_val, sp_val, stk_val))
                             count += 1
 
                         conn.commit()
