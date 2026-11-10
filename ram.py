@@ -30,7 +30,7 @@ def init_db():
         )
     """)
     
-    # Auto-Migration: Purane database me agar mrp ya selling_price column na ho to add kar do
+    # Auto-Migration for columns
     c.execute("PRAGMA table_info(inventory)")
     cols = [column[1] for column in c.fetchall()]
     
@@ -181,16 +181,185 @@ if menu == "🧾 New Bill / POS":
         b = st.session_state.last_bill
         st.markdown("---")
         st.subheader("🖨️ Printable Cash Memo")
-        memo_text = f"""
-==================================================
-              SOURYA STATIONERY
-      Narayan Talkies Road, Sihora, Jabalpur (M.P.)
-            Phone: +91-XXXXXXXXXX
-==================================================
-Bill No: #{b['bill_no']}              Date: {b['date']}
-Customer: {b['customer']}
---------------------------------------------------
-{'Item':<22}{'Qty':<6}{'Rate':<10}{'Total':<10}
---------------------------------------------------\n"""
+        
+        memo_lines = [
+            "=" * 50,
+            "              SOURYA STATIONERY",
+            "      Narayan Talkies Road, Sihora, Jabalpur (M.P.)",
+            "            Phone: +91-XXXXXXXXXX",
+            "=" * 50,
+            f"Bill No: #{b['bill_no']:<15} Date: {b['date']}",
+            f"Customer: {b['customer']}",
+            "-" * 50,
+            f"{'Item':<22}{'Qty':<6}{'Rate':<10}{'Total':<10}",
+            "-" * 50
+        ]
+        
         for it in b['items']:
-            memo_text += f"{it['Item'][:20]:<22}{it['Quantity']:<6}{it['Rate (₹)']:<10.2f}{it['Total (₹)']:<10.
+            item_name = str(it['Item'])[:20]
+            item_qty = int(it['Quantity'])
+            item_rate = float(it['Rate (₹)'])
+            item_tot = float(it['Total (₹)'])
+            line = f"{item_name:<22}{item_qty:<6}{item_rate:<10.2f}{item_tot:<10.2f}"
+            memo_lines.append(line)
+            
+        memo_lines.extend([
+            "-" * 50,
+            f"Subtotal:                             ₹{b['subtotal']:.2f}",
+            f"Discount:                            -₹{b['discount']:.2f}",
+            "-" * 50,
+            f"GRAND TOTAL:                          ₹{b['total']:.2f}",
+            "=" * 50,
+            "   * Goods once sold will not be taken back *",
+            "         Dhanyawad! Phir Padhaariyega!",
+            "=" * 50
+        ])
+        
+        memo_text = "\n".join(memo_lines)
+        st.code(memo_text, language="text")
+        st.download_button(
+            label="📥 Download Receipt (.txt)",
+            data=memo_text,
+            file_name=f"Sourya_Stationery_Bill_{b['bill_no']}.txt",
+            mime="text/plain"
+        )
+
+# ----------------- 2. INVENTORY SECTION -----------------
+elif menu == "📦 Inventory (Add / Excel Upload)":
+    st.title("📦 Sourya Stationery - Inventory & Stock")
+
+    tab_manual, tab_excel, tab_view = st.tabs(["➕ Manual Single Item", "📂 Excel / CSV File Upload", "📋 Current Stock List"])
+
+    with tab_manual:
+        with st.form("manual_form", clear_on_submit=True):
+            col_i1, col_i2 = st.columns(2)
+            with col_i1:
+                name = st.text_input("Item Name (e.g., Classmate Notebook 120p)").strip().title()
+                category = st.selectbox("Category", [
+                    "Notebooks & Registers", 
+                    "Pens, Pencils & Erasers", 
+                    "Drawing & Art Supplies", 
+                    "Files, Folders & Envelopes", 
+                    "Desk Accessories & Calculators", 
+                    "General Goods"
+                ])
+            with col_i2:
+                mrp = st.number_input("MRP (₹)", min_value=1.0, value=50.0, step=1.0)
+                selling_price = st.number_input("Selling Price (₹)", min_value=1.0, value=45.0, step=1.0)
+                stock = st.number_input("Stock Quantity", min_value=1, step=1)
+
+            submit = st.form_submit_button("Save Permanently to Inventory", use_container_width=True)
+            if submit:
+                if name:
+                    conn = get_connection()
+                    c = conn.cursor()
+                    c.execute("""
+                        INSERT INTO inventory (name, category, mrp, selling_price, stock)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(name) DO UPDATE SET
+                            category = excluded.category,
+                            mrp = excluded.mrp,
+                            selling_price = excluded.selling_price,
+                            stock = stock + excluded.stock
+                    """, (name, category, mrp, selling_price, stock))
+                    conn.commit()
+                    conn.close()
+                    st.success(f"'{name}' successfully save ho gaya!")
+                else:
+                    st.error("Item name likhna zaroori hai.")
+
+    with tab_excel:
+        st.subheader("Bulk Stock Upload via Excel / CSV")
+        st.write("Excel columns: `name`, `category`, `mrp`, `selling_price`, `stock`")
+        
+        sample_df = pd.DataFrame([
+            {"name": "Classmate Notebook", "category": "Notebooks & Registers", "mrp": 60.0, "selling_price": 55.0, "stock": 50},
+            {"name": "Reynolds Ball Pen Blue", "category": "Pens, Pencils & Erasers", "mrp": 10.0, "selling_price": 10.0, "stock": 100},
+            {"name": "Doms Color Kit", "category": "Drawing & Art Supplies", "mrp": 150.0, "selling_price": 140.0, "stock": 20}
+        ])
+        
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            sample_df.to_excel(writer, index=False)
+        st.download_button(
+            label="📥 Download Sample Excel Template",
+            data=output.getvalue(),
+            file_name="sample_stationery_format.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        uploaded_file = st.file_uploader("Upload Excel ya CSV File", type=["xlsx", "xls", "csv"])
+        if uploaded_file:
+            try:
+                if uploaded_file.name.endswith(".csv"):
+                    df_upload = pd.read_csv(uploaded_file)
+                else:
+                    df_upload = pd.read_excel(uploaded_file)
+
+                df_upload.columns = [c.strip().lower() for c in df_upload.columns]
+                required_cols = {"name", "category", "mrp", "selling_price", "stock"}
+
+                if required_cols.issubset(set(df_upload.columns)):
+                    st.write("File Preview:")
+                    st.dataframe(df_upload.head(10), use_container_width=True)
+
+                    if st.button("🚀 Upload & Permanently Save to Database", type="primary"):
+                        conn = get_connection()
+                        c = conn.cursor()
+                        count = 0
+                        for _, r in df_upload.iterrows():
+                            item_name = str(r["name"]).strip().title()
+                            cat = str(r["category"]).strip()
+                            mrp_val = float(r["mrp"])
+                            sp_val = float(r["selling_price"])
+                            stk_val = int(r["stock"])
+
+                            c.execute("""
+                                INSERT INTO inventory (name, category, mrp, selling_price, stock)
+                                VALUES (?, ?, ?, ?, ?)
+                                ON CONFLICT(name) DO UPDATE SET
+                                    category = excluded.category,
+                                    mrp = excluded.mrp,
+                                    selling_price = excluded.selling_price,
+                                    stock = stock + excluded.stock
+                            """, (item_name, cat, mrp_val, sp_val, stk_val))
+                            count += 1
+
+                        conn.commit()
+                        conn.close()
+                        st.success(f"Zabardast! {count} items database me permanently save ho gaye.")
+                else:
+                    st.error(f"Excel me ye saare columns hone zaroori hain: {', '.join(required_cols)}")
+            except Exception as e:
+                st.error(f"File padhne me error: {e}")
+
+    with tab_view:
+        conn = get_connection()
+        df_stock = pd.read_sql("SELECT id as 'ID', name as 'Item Name', category as 'Category', mrp as 'MRP (₹)', selling_price as 'Selling Price (₹)', stock as 'Available Qty' FROM inventory", conn)
+        conn.close()
+
+        if not df_stock.empty:
+            st.dataframe(df_stock, use_container_width=True)
+            low_stock = df_stock[df_stock["Available Qty"] <= 5]
+            if not low_stock.empty:
+                st.error("⚠️ Low Stock Alert (Quantity ≤ 5):")
+                st.dataframe(low_stock)
+        else:
+            st.info("Inventory khali hai.")
+
+# ----------------- 3. SALES HISTORY -----------------
+elif menu == "📊 Sales & Reports":
+    st.title("📊 Sourya Stationery - Sales Report")
+
+    conn = get_connection()
+    df_sales = pd.read_sql("SELECT bill_no as 'Bill ID', customer_name as 'Customer', items_summary as 'Items', total_amount as 'Total (₹)', bill_date as 'Date' FROM sales ORDER BY bill_no DESC", conn)
+    conn.close()
+
+    if not df_sales.empty:
+        metric1, metric2 = st.columns(2)
+        metric1.metric("Total Revenue", f"₹{df_sales['Total (₹)'].sum():.2f}")
+        metric2.metric("Total Bills Cut", len(df_sales))
+
+        st.dataframe(df_sales, use_container_width=True)
+    else:
+        st.info("Abhi tak koi bill generate nahi hua hai.")
