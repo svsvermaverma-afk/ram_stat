@@ -5,7 +5,7 @@ from datetime import datetime
 import io
 from fpdf import FPDF
 
-# 1. Responsive Viewport for Mobile & Desktop
+# 1. Page Configuration (Mobile & Desktop Responsive)
 st.set_page_config(
     page_title="Sourya Stationery - POS", 
     page_icon="📚", 
@@ -13,7 +13,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Custom CSS for Mobile Touch Targets & Receipt Layout
+# Custom CSS for Mobile Touch Targets & Clean Layout
 st.markdown("""
 <style>
     .block-container {
@@ -29,13 +29,14 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Database Connection & Setup
+# 2. Database Connection & Schema Setup
 def get_connection():
     return sqlite3.connect("sourya_stationery.db", check_same_thread=False)
 
 def init_db():
     conn = get_connection()
     c = conn.cursor()
+    # Inventory Table creation
     c.execute("""
         CREATE TABLE IF NOT EXISTS inventory (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,7 +49,7 @@ def init_db():
         )
     """)
     
-    # Auto-Migration checks
+    # Auto-Migration for column compatibility
     c.execute("PRAGMA table_info(inventory)")
     cols = [column[1] for column in c.fetchall()]
     
@@ -65,6 +66,7 @@ def init_db():
         c.execute("ALTER TABLE inventory ADD COLUMN price REAL DEFAULT 0")
         c.execute("UPDATE inventory SET price = selling_price")
 
+    # Sales Table creation
     c.execute("""
         CREATE TABLE IF NOT EXISTS sales (
             bill_no INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,9 +83,9 @@ def init_db():
 
 init_db()
 
-# Helper: Generate Clean Thermal / Standard PDF Receipt
+# 3. Helper: Generate Clean 80mm PDF Receipt (Error-Proof)
 def build_pdf_receipt(bill_data):
-    pdf = FPDF(format=(80, 200)) # 80mm thermal/mobile slip width
+    pdf = FPDF(format=(80, 200))
     pdf.set_auto_page_break(auto=True, margin=5)
     pdf.add_page()
     
@@ -112,13 +114,17 @@ def build_pdf_receipt(bill_data):
     pdf.line(4, pdf.get_y(), 76, pdf.get_y())
     pdf.ln(1)
 
-    # Item Rows (Selling Price only)
+    # Item Rows (Safe key fetching)
     pdf.set_font("Helvetica", "", 8)
     for it in bill_data['items']:
-        name = str(it['Item'])[:18]
-        qty = str(it['Quantity'])
-        rate = f"{float(it['Rate (INR)']):.1f}"
-        tot = f"{float(it['Total (INR)']):.1f}"
+        name = str(it.get('Item', 'Item'))[:18]
+        qty = str(it.get('Quantity', 1))
+        raw_rate = it.get('Rate (INR)', it.get('Rate (₹)', it.get('Rate', 0.0)))
+        raw_tot = it.get('Total (INR)', it.get('Total (₹)', it.get('Total', 0.0)))
+        
+        rate = f"{float(raw_rate):.1f}"
+        tot = f"{float(raw_tot):.1f}"
+        
         pdf.cell(32, 4, name, 0, 0)
         pdf.cell(10, 4, qty, 0, 0, "C")
         pdf.cell(15, 4, rate, 0, 0, "R")
@@ -131,7 +137,7 @@ def build_pdf_receipt(bill_data):
     pdf.cell(45, 4, "Subtotal:", 0, 0)
     pdf.cell(27, 4, f"Rs. {bill_data['subtotal']:.2f}", 0, 1, "R")
     
-    if bill_data['discount'] > 0:
+    if bill_data.get('discount', 0) > 0:
         pdf.cell(45, 4, "Discount:", 0, 0)
         pdf.cell(27, 4, f"- Rs. {bill_data['discount']:.2f}", 0, 1, "R")
         
@@ -150,18 +156,19 @@ def build_pdf_receipt(bill_data):
 
     return bytes(pdf.output())
 
-# Session State
+# 4. Session State Setup
 if "cart" not in st.session_state:
     st.session_state.cart = []
 if "last_bill" not in st.session_state:
     st.session_state.last_bill = None
 
-# Sidebar
+# Sidebar Navigation
 st.sidebar.markdown("## 📚 Sourya Stationery")
 st.sidebar.caption("Narayan Talkies Road, Sihora")
+st.sidebar.markdown("---")
 menu = st.sidebar.radio("Navigation", ["🧾 New Bill / POS", "📦 Inventory Management", "📊 Sales & Reports"])
 
-# ----------------- 1. BILLING SECTION -----------------
+# ----------------- MODULE 1: BILLING (POS) -----------------
 if menu == "🧾 New Bill / POS":
     st.title("📚 Sourya Stationery - POS Counter")
     
@@ -169,7 +176,6 @@ if menu == "🧾 New Bill / POS":
     df_items = pd.read_sql("SELECT * FROM inventory WHERE stock > 0", conn)
     conn.close()
 
-    # Layout adjusts cleanly on Mobile (stacks vertically) & Desktop (side-by-side)
     col_entry, col_cart = st.columns([1, 1], gap="medium")
 
     with col_entry:
@@ -197,7 +203,7 @@ if menu == "🧾 New Bill / POS":
                         st.session_state.cart[match_index]["Total (INR)"] = new_q * sell_price
                         st.success(f"Updated quantity for {selected_item}")
                     else:
-                        st.error(f"Stock se jyada quantity add nahi kar sakte! (Stock: {stock_qty})")
+                        st.error(f"Stock se jyada quantity add nahi kar sakte! (Available: {stock_qty})")
                 else:
                     st.session_state.cart.append({
                         "Item": selected_item,
@@ -217,10 +223,7 @@ if menu == "🧾 New Bill / POS":
 
             subtotal = float(cart_df["Total (INR)"].sum())
             
-            col_disc, col_dummy = st.columns([1, 1])
-            with col_disc:
-                discount_pct = st.number_input("Discount (%)", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
-            
+            discount_pct = st.number_input("Discount (%)", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
             discount_val = (subtotal * discount_pct) / 100
             final_total = round(subtotal - discount_val, 2)
 
@@ -271,21 +274,19 @@ if menu == "🧾 New Bill / POS":
     if st.session_state.last_bill:
         b = st.session_state.last_bill
         st.markdown("---")
-        st.subheader(f"🧾 Bill #{b['bill_no']} - Printable PDF Ready")
+        st.subheader(f"🧾 Bill #{b['bill_no']} - Ready to Download")
 
         pdf_bytes = build_pdf_receipt(b)
         
-        col_down1, col_down2 = st.columns([1, 1])
-        with col_down1:
-            st.download_button(
-                label="📄 Download PDF Invoice",
-                data=pdf_bytes,
-                file_name=f"Sourya_Stationery_Bill_{b['bill_no']}.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
+        st.download_button(
+            label="📄 Download PDF Invoice",
+            data=pdf_bytes,
+            file_name=f"Sourya_Stationery_Bill_{b['bill_no']}.pdf",
+            mime="application/pdf",
+            use_container_width=True
+        )
 
-# ----------------- 2. INVENTORY SECTION -----------------
+# ----------------- MODULE 2: INVENTORY -----------------
 elif menu == "📦 Inventory Management":
     st.title("📦 Sourya Stationery - Inventory")
 
@@ -301,6 +302,7 @@ elif menu == "📦 Inventory Management":
                     "Pens, Pencils & Erasers", 
                     "Drawing & Art Supplies", 
                     "Files, Folders & Envelopes", 
+                    "Desk Accessories & Calculators",
                     "General Goods"
                 ])
             with col_i2:
@@ -369,7 +371,14 @@ elif menu == "📦 Inventory Management":
                                     mrp = excluded.mrp,
                                     selling_price = excluded.selling_price,
                                     stock = stock + excluded.stock
-                            """, (str(r["name"]).strip().title(), str(r["category"]).strip(), float(r["selling_price"]), float(r["mrp"]), float(r["selling_price"]), int(r["stock"])))
+                            """, (
+                                str(r["name"]).strip().title(), 
+                                str(r["category"]).strip(), 
+                                float(r["selling_price"]), 
+                                float(r["mrp"]), 
+                                float(r["selling_price"]), 
+                                int(r["stock"])
+                            ))
                             count += 1
 
                         conn.commit()
@@ -387,10 +396,14 @@ elif menu == "📦 Inventory Management":
 
         if not df_stock.empty:
             st.dataframe(df_stock, use_container_width=True)
+            low_stock = df_stock[df_stock["Available Qty"] <= 5]
+            if not low_stock.empty:
+                st.error("⚠️ Low Stock Alert (Quantity ≤ 5):")
+                st.dataframe(low_stock)
         else:
             st.info("Inventory khali hai.")
 
-# ----------------- 3. SALES HISTORY -----------------
+# ----------------- MODULE 3: SALES HISTORY -----------------
 elif menu == "📊 Sales & Reports":
     st.title("📊 Sales Report")
     conn = get_connection()
