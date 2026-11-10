@@ -18,18 +18,34 @@ def get_connection():
 def init_db():
     conn = get_connection()
     c = conn.cursor()
-    # Inventory Table with MRP and Selling Price
+    # Inventory Table creation
     c.execute("""
         CREATE TABLE IF NOT EXISTS inventory (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL,
             category TEXT,
-            mrp REAL NOT NULL,
-            selling_price REAL NOT NULL,
-            stock INTEGER NOT NULL
+            mrp REAL DEFAULT 0,
+            selling_price REAL DEFAULT 0,
+            stock INTEGER DEFAULT 0
         )
     """)
-    # Sales History Table
+    
+    # Auto-Migration: Purane database me agar mrp ya selling_price column na ho to add kar do
+    c.execute("PRAGMA table_info(inventory)")
+    cols = [column[1] for column in c.fetchall()]
+    
+    if "selling_price" not in cols:
+        if "price" in cols:
+            c.execute("ALTER TABLE inventory ADD COLUMN selling_price REAL DEFAULT 0")
+            c.execute("UPDATE inventory SET selling_price = price")
+        else:
+            c.execute("ALTER TABLE inventory ADD COLUMN selling_price REAL DEFAULT 0")
+            
+    if "mrp" not in cols:
+        c.execute("ALTER TABLE inventory ADD COLUMN mrp REAL DEFAULT 0")
+        c.execute("UPDATE inventory SET mrp = selling_price")
+
+    # Sales Table
     c.execute("""
         CREATE TABLE IF NOT EXISTS sales (
             bill_no INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,13 +93,12 @@ if menu == "🧾 New Bill / POS":
             selected_item = st.selectbox("Search & Select Item", item_list)
             
             row = df_items[df_items["name"] == selected_item].iloc[0]
-            mrp_price = float(row["mrp"])
-            sell_price = float(row["selling_price"])
-            stock_qty = int(row["stock"])
+            mrp_price = float(row.get("mrp", row.get("selling_price", 0.0)))
+            sell_price = float(row.get("selling_price", row.get("price", 0.0)))
+            stock_qty = int(row.get("stock", 0))
 
-            # Counter par cashier ko MRP aur Selling Price dono dikhenge
             st.info(f"**MRP:** ₹{mrp_price:.2f} | **Selling Price:** ₹{sell_price:.2f} | **Stock:** {stock_qty} pcs")
-            qty = st.number_input("Quantity", min_value=1, max_value=stock_qty, value=1, step=1)
+            qty = st.number_input("Quantity", min_value=1, max_value=max(1, stock_qty), value=1, step=1)
 
             if st.button("➕ Add to Cart", use_container_width=True):
                 match_index = next((i for i, item in enumerate(st.session_state.cart) if item["Item"] == selected_item), None)
@@ -96,7 +111,6 @@ if menu == "🧾 New Bill / POS":
                     else:
                         st.error(f"Stock se jyada quantity nahi jod sakte! Available: {stock_qty}")
                 else:
-                    # Cart aur bill me sirf Selling Price jayega
                     st.session_state.cart.append({
                         "Item": selected_item,
                         "Rate (₹)": sell_price,
@@ -115,7 +129,6 @@ if menu == "🧾 New Bill / POS":
 
             subtotal = float(cart_df["Total (₹)"].sum())
             
-            # Discount feature
             discount_pct = st.number_input("Discount (%)", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
             discount_val = (subtotal * discount_pct) / 100
             final_total = round(subtotal - discount_val, 2)
@@ -132,11 +145,9 @@ if menu == "🧾 New Bill / POS":
                     items_summary = ", ".join([f"{i['Item']} ({i['Quantity']}x)" for i in st.session_state.cart])
                     bill_time = datetime.now().strftime("%d-%m-%Y %I:%M %p")
 
-                    # Stock update
                     for item in st.session_state.cart:
                         c.execute("UPDATE inventory SET stock = stock - ? WHERE name = ?", (item["Quantity"], item["Item"]))
 
-                    # Sale entry
                     c.execute("""
                         INSERT INTO sales (customer_name, items_summary, subtotal, discount, total_amount, bill_date)
                         VALUES (?, ?, ?, ?, ?, ?)
@@ -165,7 +176,7 @@ if menu == "🧾 New Bill / POS":
         else:
             st.info("Cart khali hai.")
 
-    # Printable Cash Memo View (Sirf Selling Price aayega)
+    # Printable Cash Memo View
     if st.session_state.last_bill:
         b = st.session_state.last_bill
         st.markdown("---")
@@ -182,28 +193,4 @@ Customer: {b['customer']}
 {'Item':<22}{'Qty':<6}{'Rate':<10}{'Total':<10}
 --------------------------------------------------\n"""
         for it in b['items']:
-            memo_text += f"{it['Item'][:20]:<22}{it['Quantity']:<6}{it['Rate (₹)']:<10.2f}{it['Total (₹)']:<10.2f}\n"
-
-        memo_text += f"""--------------------------------------------------
-Subtotal:                             ₹{b['subtotal']:.2f}
-Discount:                            -₹{b['discount']:.2f}
---------------------------------------------------
-GRAND TOTAL:                          ₹{b['total']:.2f}
-==================================================
-   * Goods once sold will not be taken back *
-         Dhanyawad! Phir Padhaariyega!
-==================================================
-"""
-        st.code(memo_text, language="text")
-        st.download_button(
-            label="📥 Download Receipt (.txt)",
-            data=memo_text,
-            file_name=f"Sourya_Stationery_Bill_{b['bill_no']}.txt",
-            mime="text/plain"
-        )
-
-# ----------------- 2. INVENTORY SECTION -----------------
-elif menu == "📦 Inventory (Add / Excel Upload)":
-    st.title("📦 Sourya Stationery - Inventory & Stock")
-
-    tab
+            memo_text += f"{it['Item'][:20]:<22}{it['Quantity']:<6}{it['Rate (₹)']:<10.2f}{it['Total (₹)']:<10.
