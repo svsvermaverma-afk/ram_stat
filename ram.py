@@ -3,6 +3,7 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 import io
+import re
 from fpdf import FPDF
 
 # 1. Page Configuration (Mobile & Desktop Responsive)
@@ -13,7 +14,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Custom CSS for Mobile Touch Targets & Clean Layout
+# Custom CSS
 st.markdown("""
 <style>
     .block-container {
@@ -36,7 +37,6 @@ def get_connection():
 def init_db():
     conn = get_connection()
     c = conn.cursor()
-    # Inventory Table creation
     c.execute("""
         CREATE TABLE IF NOT EXISTS inventory (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +49,6 @@ def init_db():
         )
     """)
     
-    # Auto-Migration for column compatibility
     c.execute("PRAGMA table_info(inventory)")
     cols = [column[1] for column in c.fetchall()]
     
@@ -66,7 +65,6 @@ def init_db():
         c.execute("ALTER TABLE inventory ADD COLUMN price REAL DEFAULT 0")
         c.execute("UPDATE inventory SET price = selling_price")
 
-    # Sales Table creation
     c.execute("""
         CREATE TABLE IF NOT EXISTS sales (
             bill_no INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,76 +81,157 @@ def init_db():
 
 init_db()
 
-# 3. Helper: Generate Clean 80mm PDF Receipt (Error-Proof)
-def build_pdf_receipt(bill_data):
-    pdf = FPDF(format=(80, 200))
-    pdf.set_auto_page_break(auto=True, margin=5)
+# Helper: Google Sheet URL ko CSV Export URL me badalna
+def get_gsheet_csv_url(sheet_url):
+    match = re.search(r"/d/([a-zA-Z0-9-_]+)", sheet_url)
+    if match:
+        doc_id = match.group(1)
+        return f"https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv"
+    return sheet_url
+
+# 3. PDF Generator: A4 Landscape par 2 Bills Side-by-Side (Bilingual Hindi/English Memo)
+def build_side_by_side_pdf(bill_data):
+    # A4 Landscape: Width = 297mm, Height = 210mm
+    pdf = FPDF(orientation='L', unit='mm', format='A4')
+    pdf.set_auto_page_break(auto=False)
     pdf.add_page()
-    
-    # Header
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(0, 6, "SOURYA STATIONERY", ln=True, align="C")
-    pdf.set_font("Helvetica", "", 8)
-    pdf.cell(0, 4, "Narayan Talkies Road, Sihora, Jabalpur (M.P.)", ln=True, align="C")
-    pdf.cell(0, 4, "Mob: +91-XXXXXXXXXX", ln=True, align="C")
-    pdf.line(4, pdf.get_y() + 1, 76, pdf.get_y() + 1)
-    pdf.ln(3)
 
-    # Metadata
-    pdf.set_font("Helvetica", "", 8)
-    pdf.cell(0, 4, f"Bill No: #{bill_data['bill_no']}  |  Date: {bill_data['date']}", ln=True)
-    pdf.cell(0, 4, f"Customer: {bill_data['customer']}", ln=True)
-    pdf.line(4, pdf.get_y() + 1, 76, pdf.get_y() + 1)
-    pdf.ln(3)
+    # Draw vertical separator line between two halves
+    pdf.set_draw_color(180, 180, 180)
+    pdf.line(148.5, 5, 148.5, 205)
 
-    # Item Table Headings
-    pdf.set_font("Helvetica", "B", 8)
-    pdf.cell(32, 5, "Item", 0, 0)
-    pdf.cell(10, 5, "Qty", 0, 0, "C")
-    pdf.cell(15, 5, "Rate", 0, 0, "R")
-    pdf.cell(15, 5, "Total", 0, 1, "R")
-    pdf.line(4, pdf.get_y(), 76, pdf.get_y())
-    pdf.ln(1)
+    def draw_single_bill(x_offset, copy_type):
+        w = 136  # Width of bill box
+        h = 195  # Height of bill box
+        y_top = 8
 
-    # Item Rows (Safe key fetching)
-    pdf.set_font("Helvetica", "", 8)
-    for it in bill_data['items']:
-        name = str(it.get('Item', 'Item'))[:18]
-        qty = str(it.get('Quantity', 1))
-        raw_rate = it.get('Rate (INR)', it.get('Rate (₹)', it.get('Rate', 0.0)))
-        raw_tot = it.get('Total (INR)', it.get('Total (₹)', it.get('Total', 0.0)))
-        
-        rate = f"{float(raw_rate):.1f}"
-        tot = f"{float(raw_tot):.1f}"
-        
-        pdf.cell(32, 4, name, 0, 0)
-        pdf.cell(10, 4, qty, 0, 0, "C")
-        pdf.cell(15, 4, rate, 0, 0, "R")
-        pdf.cell(15, 4, tot, 0, 1, "R")
+        # Outer Border Box
+        pdf.set_draw_color(0, 0, 0)
+        pdf.set_line_width(0.3)
+        pdf.rect(x_offset, y_top, w, h)
 
-    pdf.line(4, pdf.get_y() + 1, 76, pdf.get_y() + 1)
-    pdf.ln(2)
+        # Header 1: Proprietor & Mobile
+        pdf.set_xy(x_offset + 3, y_top + 2)
+        pdf.set_font("Helvetica", "B", 7.5)
+        pdf.cell(50, 4, "Prop: Shriram Chandravanshi", 0, 0, "L")
+        pdf.cell(32, 4, f"[{copy_type}]", 0, 0, "C")
+        pdf.cell(48, 4, "Mob: 9039626922, 8770713490", 0, 1, "R")
 
-    # Summary
-    pdf.cell(45, 4, "Subtotal:", 0, 0)
-    pdf.cell(27, 4, f"Rs. {bill_data['subtotal']:.2f}", 0, 1, "R")
-    
-    if bill_data.get('discount', 0) > 0:
-        pdf.cell(45, 4, "Discount:", 0, 0)
-        pdf.cell(27, 4, f"- Rs. {bill_data['discount']:.2f}", 0, 1, "R")
-        
-    pdf.line(4, pdf.get_y() + 1, 76, pdf.get_y() + 1)
-    pdf.ln(2)
-    
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(45, 6, "GRAND TOTAL:", 0, 0)
-    pdf.cell(27, 6, f"Rs. {bill_data['total']:.2f}", 0, 1, "R")
+        # Shop Name
+        pdf.set_x(x_offset)
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.cell(w, 6, "SOURYA STATIONERY & SPORTS", 0, 1, "C")
 
-    # Footer
-    pdf.ln(4)
-    pdf.set_font("Helvetica", "I", 7)
-    pdf.cell(0, 3, "Goods once sold will not be taken back", ln=True, align="C")
-    pdf.cell(0, 3, "Dhanyawad! Phir Padhaariyega!", ln=True, align="C")
+        # Sub-title & Category
+        pdf.set_x(x_offset)
+        pdf.set_font("Helvetica", "", 7.5)
+        pdf.cell(w, 4, "School, College, Office Stationery, Sports Goods, Gifts & General Items", 0, 1, "C")
+
+        # Address Band
+        pdf.set_x(x_offset)
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.cell(w, 4.5, "Talkies Road, Ward No. 5, Sihora, Jabalpur (M.P.)", 1, 1, "C")
+
+        # Bill Meta Info
+        pdf.ln(1)
+        curr_y = pdf.get_y()
+        pdf.set_xy(x_offset + 3, curr_y)
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.cell(16, 5, "Bill No / Kr:", 0, 0)
+        pdf.set_text_color(180, 0, 0)
+        pdf.cell(35, 5, f"#{bill_data['bill_no']}", 0, 0)
+        pdf.set_text_color(0, 0, 0)
+        pdf.cell(40, 5, "", 0, 0)
+        pdf.cell(15, 5, "Date:", 0, 0)
+        pdf.set_font("Helvetica", "", 8)
+        pdf.cell(27, 5, f"{bill_data['date']}", 0, 1, "R")
+
+        # Customer Details
+        pdf.set_x(x_offset + 3)
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.cell(20, 5, "Shreeman:", 0, 0)
+        pdf.set_font("Helvetica", "", 8)
+        pdf.cell(110, 5, f"{bill_data['customer']}", "B", 1)
+
+        # Table Header
+        pdf.ln(2)
+        table_y = pdf.get_y()
+        pdf.set_xy(x_offset + 2, table_y)
+        col_sno = 10
+        col_desc = 64
+        col_qty = 18
+        col_rate = 20
+        col_amt = 20
+
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.cell(col_sno, 6, "S.N.", 1, 0, "C")
+        pdf.cell(col_desc, 6, "Description / Vivaran", 1, 0, "C")
+        pdf.cell(col_qty, 6, "Qty", 1, 0, "C")
+        pdf.cell(col_rate, 6, "Rate (Rs)", 1, 0, "C")
+        pdf.cell(col_amt, 6, "Amount", 1, 1, "C")
+
+        # Item Rows Area
+        row_start_y = pdf.get_y()
+        max_rows = 11
+        row_height = 7
+        total_table_height = max_rows * row_height
+
+        pdf.set_font("Helvetica", "", 8)
+        for idx in range(max_rows):
+            r_y = row_start_y + (idx * row_height)
+            pdf.set_xy(x_offset + 2, r_y)
+            if idx < len(bill_data['items']):
+                it = bill_data['items'][idx]
+                name = str(it.get('Item', 'Item'))[:30]
+                qty = str(it.get('Quantity', 1))
+                rate = f"{float(it.get('Rate (INR)', 0)):.1f}"
+                tot = f"{float(it.get('Total (INR)', 0)):.1f}"
+
+                pdf.cell(col_sno, row_height, str(idx + 1), "LR", 0, "C")
+                pdf.cell(col_desc, row_height, f" {name}", "LR", 0, "L")
+                pdf.cell(col_qty, row_height, qty, "LR", 0, "C")
+                pdf.cell(col_rate, row_height, f"{rate} ", "LR", 0, "R")
+                pdf.cell(col_amt, row_height, f"{tot} ", "LR", 1, "R")
+            else:
+                pdf.cell(col_sno, row_height, "", "LR", 0, "C")
+                pdf.cell(col_desc, row_height, "", "LR", 0, "L")
+                pdf.cell(col_qty, row_height, "", "LR", 0, "C")
+                pdf.cell(col_rate, row_height, "", "LR", 0, "R")
+                pdf.cell(col_amt, row_height, "", "LR", 1, "R")
+
+        bottom_y = row_start_y + total_table_height
+
+        # Bottom Border of Items
+        pdf.line(x_offset + 2, bottom_y, x_offset + 2 + w - 4, bottom_y)
+
+        # Discount row if applicable
+        if bill_data.get('discount', 0) > 0:
+            pdf.set_xy(x_offset + 2, bottom_y)
+            pdf.set_font("Helvetica", "", 7.5)
+            pdf.cell(col_sno + col_desc + col_qty, 5, "Discount Applied", 1, 0, "R")
+            pdf.cell(col_rate + col_amt, 5, f"- Rs. {bill_data['discount']:.2f} ", 1, 1, "R")
+            bottom_y += 5
+
+        # Grand Total / Kul Yog
+        pdf.set_xy(x_offset + 2, bottom_y)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(col_sno + col_desc + col_qty, 7, "KUL YOG / GRAND TOTAL:", 1, 0, "R")
+        pdf.cell(col_rate + col_amt, 7, f"Rs. {bill_data['total']:.2f} ", 1, 1, "R")
+
+        # Footer Signature
+        pdf.set_xy(x_offset + 4, y_top + h - 14)
+        pdf.set_font("Helvetica", "I", 7)
+        pdf.cell(60, 4, "* Goods once sold will not be taken back", 0, 0, "L")
+        pdf.set_font("Helvetica", "B", 7.5)
+        pdf.cell(68, 4, "Vaste - Sourya Stationery & Sports", 0, 1, "R")
+        pdf.set_xy(x_offset + 4, y_top + h - 9)
+        pdf.set_font("Helvetica", "I", 7)
+        pdf.cell(60, 4, "Thank you! Please visit again.", 0, 0, "L")
+        pdf.cell(68, 4, "(Authorized Signatory)", 0, 1, "R")
+
+    # Render Left Bill (Customer Copy) & Right Bill (Shop Copy)
+    draw_single_bill(6, "CUSTOMER COPY")
+    draw_single_bill(154, "SHOP COPY")
 
     return bytes(pdf.output())
 
@@ -222,7 +301,6 @@ if menu == "🧾 New Bill / POS":
             st.dataframe(cart_df, use_container_width=True)
 
             subtotal = float(cart_df["Total (INR)"].sum())
-            
             discount_pct = st.number_input("Discount (%)", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
             discount_val = (subtotal * discount_pct) / 100
             final_total = round(subtotal - discount_val, 2)
@@ -274,14 +352,14 @@ if menu == "🧾 New Bill / POS":
     if st.session_state.last_bill:
         b = st.session_state.last_bill
         st.markdown("---")
-        st.subheader(f"🧾 Bill #{b['bill_no']} - Ready to Download")
+        st.subheader(f"🧾 Bill #{b['bill_no']} - Ready to Print (2-in-1 Side-by-Side Memo)")
 
-        pdf_bytes = build_pdf_receipt(b)
+        pdf_bytes = build_side_by_side_pdf(b)
         
         st.download_button(
-            label="📄 Download PDF Invoice",
+            label="📄 Download Side-by-Side Dual Bill (PDF)",
             data=pdf_bytes,
-            file_name=f"Sourya_Stationery_Bill_{b['bill_no']}.pdf",
+            file_name=f"Sourya_Stationery_Dual_Bill_{b['bill_no']}.pdf",
             mime="application/pdf",
             use_container_width=True
         )
@@ -290,7 +368,64 @@ if menu == "🧾 New Bill / POS":
 elif menu == "📦 Inventory Management":
     st.title("📦 Sourya Stationery - Inventory")
 
-    tab_manual, tab_excel, tab_view = st.tabs(["➕ Manual Entry", "📂 Excel Bulk Upload", "📋 Stock List"])
+    tab_gsheet, tab_manual, tab_excel, tab_view = st.tabs([
+        "🌐 Google Sheet Sync", "➕ Manual Entry", "📂 Excel Bulk Upload", "📋 Stock List"
+    ])
+
+    # Google Sheets Tab
+    with tab_gsheet:
+        st.subheader("🌐 Sync Inventory from Google Sheets")
+        default_sheet_url = "https://docs.google.com/spreadsheets/d/1rHEQ8o7u3mvGxh5VJuyJ9EU4-h9TH2Abx4niXByBHV4/edit?usp=sharing"
+        sheet_url_input = st.text_input("Google Sheet Share Link", value=default_sheet_url)
+        
+        col_s1, col_s2 = st.columns([1, 1])
+        with col_s1:
+            load_btn = st.button("🔄 Fetch / Reload from Google Sheets", type="primary", use_container_width=True)
+            
+        if load_btn or ("gsheet_cache_df" in st.session_state):
+            try:
+                csv_url = get_gsheet_csv_url(sheet_url_input)
+                df_gsheet = pd.read_csv(csv_url)
+                df_gsheet.columns = [str(c).strip().lower() for c in df_gsheet.columns]
+                st.session_state.gsheet_cache_df = df_gsheet
+                
+                st.success("Google Sheet se live data successfully fetch ho gaya!")
+                st.dataframe(df_gsheet, use_container_width=True)
+                
+                required_cols = {"name", "category", "mrp", "selling_price", "stock"}
+                if required_cols.issubset(set(df_gsheet.columns)):
+                    if st.button("💾 Save / Update into Local Database", type="secondary", use_container_width=True):
+                        conn = get_connection()
+                        c = conn.cursor()
+                        count = 0
+                        for _, r in df_gsheet.iterrows():
+                            if pd.notna(r["name"]):
+                                c.execute("""
+                                    INSERT INTO inventory (name, category, price, mrp, selling_price, stock)
+                                    VALUES (?, ?, ?, ?, ?, ?)
+                                    ON CONFLICT(name) DO UPDATE SET
+                                        category = excluded.category,
+                                        price = excluded.price,
+                                        mrp = excluded.mrp,
+                                        selling_price = excluded.selling_price,
+                                        stock = excluded.stock
+                                """, (
+                                    str(r["name"]).strip().title(),
+                                    str(r.get("category", "General Goods")).strip(),
+                                    float(r.get("selling_price", 0.0)),
+                                    float(r.get("mrp", 0.0)),
+                                    float(r.get("selling_price", 0.0)),
+                                    int(r.get("stock", 0))
+                                ))
+                                count += 1
+                        conn.commit()
+                        conn.close()
+                        st.success(f"{count} items database me sync aur update ho gaye!")
+                else:
+                    st.error(f"Columns missing hain! Sheet me ye columns hone chahiye: {list(required_cols)}")
+            except Exception as e:
+                st.error(f"Google Sheet fetch karne me error: {e}")
+                st.info("Kripya ensure karein ki Google Sheet ki Sharing setting 'Anyone with the link can view' ho.")
 
     with tab_manual:
         with st.form("manual_form", clear_on_submit=True):
