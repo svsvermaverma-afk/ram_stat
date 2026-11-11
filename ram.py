@@ -7,7 +7,7 @@ import re
 import json
 from fpdf import FPDF
 
-# 1. Page Configuration (Mobile & Desktop Responsive)
+# 1. Page Configuration
 st.set_page_config(
     page_title="Sourya Stationery - POS", 
     page_icon="📚", 
@@ -15,7 +15,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Custom CSS
+# Custom CSS for Mobile Touch Targets & Clean Layout
 st.markdown("""
 <style>
     .block-container {
@@ -32,12 +32,16 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # 2. Database Connection & Schema Setup
+DB_FILE = "sourya_stationery.db"
+
 def get_connection():
-    return sqlite3.connect("sourya_stationery.db", check_same_thread=False)
+    return sqlite3.connect(DB_FILE, check_same_thread=False)
 
 def init_db():
     conn = get_connection()
     c = conn.cursor()
+    
+    # 1. Inventory Table
     c.execute("""
         CREATE TABLE IF NOT EXISTS inventory (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,24 +54,17 @@ def init_db():
         )
     """)
     
-    # Auto-migration for inventory
+    # Check Columns for Inventory
     c.execute("PRAGMA table_info(inventory)")
-    cols = [column[1] for column in c.fetchall()]
-    
-    if "selling_price" not in cols:
+    inv_cols = [col[1] for col in c.fetchall()]
+    if "selling_price" not in inv_cols:
         c.execute("ALTER TABLE inventory ADD COLUMN selling_price REAL DEFAULT 0")
-        if "price" in cols:
-            c.execute("UPDATE inventory SET selling_price = price")
-            
-    if "mrp" not in cols:
+    if "mrp" not in inv_cols:
         c.execute("ALTER TABLE inventory ADD COLUMN mrp REAL DEFAULT 0")
-        c.execute("UPDATE inventory SET mrp = selling_price")
-
-    if "price" not in cols:
+    if "price" not in inv_cols:
         c.execute("ALTER TABLE inventory ADD COLUMN price REAL DEFAULT 0")
-        c.execute("UPDATE inventory SET price = selling_price")
 
-    # Sales Table with items_json for permanent bill printing
+    # 2. Sales Table (Permanent Storage)
     c.execute("""
         CREATE TABLE IF NOT EXISTS sales (
             bill_no INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,9 +78,9 @@ def init_db():
         )
     """)
     
-    # Check if items_json exists in sales
+    # Check Columns for Sales
     c.execute("PRAGMA table_info(sales)")
-    sales_cols = [column[1] for column in c.fetchall()]
+    sales_cols = [col[1] for col in c.fetchall()]
     if "items_json" not in sales_cols:
         c.execute("ALTER TABLE sales ADD COLUMN items_json TEXT")
 
@@ -92,7 +89,9 @@ def init_db():
 
 init_db()
 
-# Helper: Google Sheet URL converter
+# Google Sheet Auto-Sync Setup
+GSHEET_URL = "https://docs.google.com/spreadsheets/d/1rHEQ8o7u3mvGxh5VJuyJ9EU4-h9TH2Abx4niXByBHV4/edit?usp=sharing"
+
 def get_gsheet_csv_url(sheet_url):
     match = re.search(r"/d/([a-zA-Z0-9-_]+)", sheet_url)
     if match:
@@ -100,14 +99,56 @@ def get_gsheet_csv_url(sheet_url):
         return f"https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv"
     return sheet_url
 
-# Helper: Database se Bill Fetch karna (Reload hone par bhi bill na khoye)
-def get_bill_from_db(bill_id=None):
+# Cache data for 60 seconds taaki page load fast rahe aur data auto-update hota rahe
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_gsheet_df(url):
+    csv_url = get_gsheet_csv_url(url)
+    df = pd.read_csv(csv_url)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    return df
+
+def auto_sync_google_sheet():
+    try:
+        df_sheet = fetch_gsheet_df(GSHEET_URL)
+        required_cols = {"name", "category", "mrp", "selling_price", "stock"}
+        if required_cols.issubset(set(df_sheet.columns)):
+            conn = get_connection()
+            c = conn.cursor()
+            for _, r in df_sheet.iterrows():
+                if pd.notna(r["name"]) and str(r["name"]).strip():
+                    item_name = str(r["name"]).strip().title()
+                    cat = str(r.get("category", "General Goods")).strip()
+                    mrp_val = float(r.get("mrp", 0.0))
+                    sell_val = float(r.get("selling_price", 0.0))
+                    stock_val = int(r.get("stock", 0))
+                    
+                    c.execute("""
+                        INSERT INTO inventory (name, category, price, mrp, selling_price, stock)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(name) DO UPDATE SET
+                            category = excluded.category,
+                            price = excluded.price,
+                            mrp = excluded.mrp,
+                            selling_price = excluded.selling_price,
+                            stock = excluded.stock
+                    """, (item_name, cat, sell_val, mrp_val, sell_val, stock_val))
+            conn.commit()
+            conn.close()
+            return True, len(df_sheet)
+    except Exception as e:
+        return False, str(e)
+    return False, "Columns mismatch"
+
+# App load hote hi background me Google Sheet auto sync ho jayegi
+auto_sync_google_sheet()
+
+# Database se kisi bhi bill ko fetch karne ka function
+def get_bill_record(bill_no=None):
     conn = get_connection()
     c = conn.cursor()
-    if bill_id:
-        c.execute("SELECT bill_no, customer_name, bill_date, subtotal, discount, total_amount, items_json FROM sales WHERE bill_no = ?", (bill_id,))
+    if bill_no:
+        c.execute("SELECT bill_no, customer_name, bill_date, subtotal, discount, total_amount, items_json FROM sales WHERE bill_no = ?", (bill_no,))
     else:
-        # Aakhri generate hua bill
         c.execute("SELECT bill_no, customer_name, bill_date, subtotal, discount, total_amount, items_json FROM sales ORDER BY bill_no DESC LIMIT 1")
     row = c.fetchone()
     conn.close()
@@ -130,13 +171,13 @@ def get_bill_from_db(bill_id=None):
         }
     return None
 
-# 3. PDF Generator: A4 Landscape 2 Bills Side-by-Side
+# 3. PDF Generator: A4 Landscape par 2 Bills Side-by-Side (Bilingual Photo Layout)
 def build_side_by_side_pdf(bill_data):
     pdf = FPDF(orientation='L', unit='mm', format='A4')
     pdf.set_auto_page_break(auto=False)
     pdf.add_page()
 
-    # Center Separator
+    # Center Separator Line
     pdf.set_draw_color(180, 180, 180)
     pdf.line(148.5, 5, 148.5, 205)
 
@@ -145,11 +186,12 @@ def build_side_by_side_pdf(bill_data):
         h = 195
         y_top = 8
 
+        # Outer Box
         pdf.set_draw_color(0, 0, 0)
         pdf.set_line_width(0.3)
         pdf.rect(x_offset, y_top, w, h)
 
-        # Header 1
+        # Header 1: Prop & Mobile
         pdf.set_xy(x_offset + 3, y_top + 2)
         pdf.set_font("Helvetica", "B", 7.5)
         pdf.cell(50, 4, "Prop: Shriram Chandravanshi", 0, 0, "L")
@@ -171,7 +213,7 @@ def build_side_by_side_pdf(bill_data):
         pdf.set_font("Helvetica", "B", 8)
         pdf.cell(w, 4.5, "Talkies Road, Ward No. 5, Sihora, Jabalpur (M.P.)", 1, 1, "C")
 
-        # Meta Info
+        # Bill Meta Info
         pdf.ln(1)
         curr_y = pdf.get_y()
         pdf.set_xy(x_offset + 3, curr_y)
@@ -185,7 +227,7 @@ def build_side_by_side_pdf(bill_data):
         pdf.set_font("Helvetica", "", 8)
         pdf.cell(27, 5, f"{bill_data['date']}", 0, 1, "R")
 
-        # Customer
+        # Customer Details
         pdf.set_x(x_offset + 3)
         pdf.set_font("Helvetica", "B", 8)
         pdf.cell(20, 5, "Shreeman:", 0, 0)
@@ -205,7 +247,7 @@ def build_side_by_side_pdf(bill_data):
         pdf.cell(col_rate, 6, "Rate (Rs)", 1, 0, "C")
         pdf.cell(col_amt, 6, "Amount", 1, 1, "C")
 
-        # Items Rows
+        # Item Rows
         row_start_y = pdf.get_y()
         max_rows = 11
         row_height = 7
@@ -245,13 +287,13 @@ def build_side_by_side_pdf(bill_data):
             pdf.cell(col_rate + col_amt, 5, f"- Rs. {bill_data['discount']:.2f} ", 1, 1, "R")
             bottom_y += 5
 
-        # Grand Total
+        # Grand Total / Kul Yog
         pdf.set_xy(x_offset + 2, bottom_y)
         pdf.set_font("Helvetica", "B", 9)
         pdf.cell(col_sno + col_desc + col_qty, 7, "KUL YOG / GRAND TOTAL:", 1, 0, "R")
         pdf.cell(col_rate + col_amt, 7, f"Rs. {bill_data['total']:.2f} ", 1, 1, "R")
 
-        # Signatures
+        # Footer
         pdf.set_xy(x_offset + 4, y_top + h - 14)
         pdf.set_font("Helvetica", "I", 7)
         pdf.cell(60, 4, "* Goods once sold will not be taken back", 0, 0, "L")
@@ -262,6 +304,7 @@ def build_side_by_side_pdf(bill_data):
         pdf.cell(60, 4, "Thank you! Please visit again.", 0, 0, "L")
         pdf.cell(68, 4, "(Authorized Signatory)", 0, 1, "R")
 
+    # Draw both copies
     draw_single_bill(6, "CUSTOMER COPY")
     draw_single_bill(154, "SHOP COPY")
 
@@ -270,6 +313,8 @@ def build_side_by_side_pdf(bill_data):
 # 4. Session State Setup
 if "cart" not in st.session_state:
     st.session_state.cart = []
+if "selected_reprint_id" not in st.session_state:
+    st.session_state.selected_reprint_id = None
 
 # Sidebar Navigation
 st.sidebar.markdown("## 📚 Sourya Stationery")
@@ -322,7 +367,7 @@ if menu == "🧾 New Bill / POS":
                     })
                     st.success(f"Added {selected_item}")
         else:
-            st.warning("Inventory me stock uplabdh nahi hai. Kripya pehle inventory sync karein.")
+            st.warning("Inventory me stock uplabdh nahi hai. Google Sheet sync check karein.")
 
     with col_cart:
         st.subheader("Cart & Checkout")
@@ -348,19 +393,23 @@ if menu == "🧾 New Bill / POS":
                     bill_time = datetime.now().strftime("%d-%m-%Y %I:%M %p")
                     items_json_str = json.dumps(st.session_state.cart)
 
+                    # Deduct Stock
                     for item in st.session_state.cart:
                         c.execute("UPDATE inventory SET stock = stock - ? WHERE name = ?", (item["Quantity"], item["Item"]))
 
+                    # Save to Sales Table Permanently
                     c.execute("""
                         INSERT INTO sales (customer_name, items_summary, subtotal, discount, total_amount, bill_date, items_json)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, (cust_name, items_summary, subtotal, discount_val, final_total, bill_time, items_json_str))
                     
+                    new_bill_id = c.lastrowid
                     conn.commit()
                     conn.close()
 
                     st.session_state.cart = []
-                    st.success("Bill permanently save ho gaya!")
+                    st.session_state.selected_reprint_id = new_bill_id
+                    st.success(f"Bill #{new_bill_id} successfully save ho gaya!")
                     st.rerun()
 
             with btn_col2:
@@ -370,38 +419,31 @@ if menu == "🧾 New Bill / POS":
         else:
             st.info("Cart khali hai.")
 
-    # ---------------- BILL VIEW & REPRINT SECTION ----------------
-    # Reload hone par bhi SQLite database se latest bill hamesha screen par available rahega
-    active_bill = get_bill_from_db()
-    
-    if active_bill and active_bill['items']:
+    # ---------------- BILL VIEW & REPRINT (ALWAYS SAVED) ----------------
+    conn = get_connection()
+    all_bills = pd.read_sql("SELECT bill_no, customer_name, bill_date, total_amount FROM sales ORDER BY bill_no DESC", conn)
+    conn.close()
+
+    if not all_bills.empty:
         st.markdown("---")
-        b_col1, b_col2 = st.columns([2, 1])
+        st.subheader("🧾 Permanent Saved Bills & Printing")
+
+        # Dropdown me pichle sabhi bills hamesha available rahenge
+        bill_dict = {
+            f"Bill #{r['bill_no']} | {r['customer_name']} | Rs. {r['total_amount']:.2f} ({r['bill_date']})": r['bill_no']
+            for _, r in all_bills.iterrows()
+        }
         
-        with b_col1:
-            st.subheader(f"🧾 Last Generated Bill: #{active_bill['bill_no']} ({active_bill['customer']})")
-            st.caption(f"Date: {active_bill['date']} | Total Amount: Rs. {active_bill['total']:.2f}")
-
-        with b_col2:
-            # Agar koi aur purana bill reprint karna ho
-            conn = get_connection()
-            all_bills = pd.read_sql("SELECT bill_no, customer_name FROM sales ORDER BY bill_no DESC LIMIT 20", conn)
-            conn.close()
-            
-            if not all_bills.empty:
-                bill_options = {f"Bill #{r['bill_no']} - {r['customer_name']}": r['bill_no'] for _, r in all_bills.iterrows()}
-                selected_label = st.selectbox("Purana Bill Reprint Karein:", list(bill_options.keys()))
-                chosen_id = bill_options[selected_label]
-                if chosen_id != active_bill['bill_no']:
-                    active_bill = get_bill_from_db(chosen_id)
-
-        # PDF download button
-        if active_bill and active_bill.get('items'):
-            pdf_bytes = build_side_by_side_pdf(active_bill)
+        selected_label = st.selectbox("Purana koi bhi bill select karein print karne ke liye:", list(bill_dict.keys()), index=0)
+        target_bill_id = bill_dict[selected_label]
+        
+        bill_data = get_bill_record(target_bill_id)
+        if bill_data and bill_data['items']:
+            pdf_bytes = build_side_by_side_pdf(bill_data)
             st.download_button(
-                label=f"📄 Download Dual Bill #{active_bill['bill_no']} (PDF)",
+                label=f"📄 Download Dual Bill #{bill_data['bill_no']} (PDF)",
                 data=pdf_bytes,
-                file_name=f"Sourya_Stationery_Dual_Bill_{active_bill['bill_no']}.pdf",
+                file_name=f"Sourya_Stationery_Bill_{bill_data['bill_no']}.pdf",
                 mime="application/pdf",
                 use_container_width=True
             )
@@ -411,59 +453,30 @@ elif menu == "📦 Inventory Management":
     st.title("📦 Sourya Stationery - Inventory")
 
     tab_gsheet, tab_manual, tab_excel, tab_view = st.tabs([
-        "🌐 Google Sheet Sync", "➕ Manual Entry", "📂 Excel Bulk Upload", "📋 Stock List"
+        "🌐 Google Sheet Auto-Sync", "➕ Manual Entry", "📂 Excel Bulk Upload", "📋 Stock List"
     ])
 
     with tab_gsheet:
-        st.subheader("🌐 Sync Inventory from Google Sheets")
-        default_sheet_url = "https://docs.google.com/spreadsheets/d/1rHEQ8o7u3mvGxh5VJuyJ9EU4-h9TH2Abx4niXByBHV4/edit?usp=sharing"
-        sheet_url_input = st.text_input("Google Sheet Share Link", value=default_sheet_url)
+        st.subheader("🌐 Google Sheet Auto-Sync Status")
+        st.success("Google Sheet apne aap background me sync ho rahi hai. Kisi button ko press karne ki zaroorat nahi hai.")
         
-        load_btn = st.button("🔄 Fetch / Reload from Google Sheets", type="primary", use_container_width=True)
-            
-        if load_btn or ("gsheet_cache_df" in st.session_state):
-            try:
-                csv_url = get_gsheet_csv_url(sheet_url_input)
-                df_gsheet = pd.read_csv(csv_url)
-                df_gsheet.columns = [str(c).strip().lower() for c in df_gsheet.columns]
-                st.session_state.gsheet_cache_df = df_gsheet
-                
-                st.success("Google Sheet se live data fetch ho gaya!")
-                st.dataframe(df_gsheet, use_container_width=True)
-                
-                required_cols = {"name", "category", "mrp", "selling_price", "stock"}
-                if required_cols.issubset(set(df_gsheet.columns)):
-                    if st.button("💾 Save / Update into Local Database", type="secondary", use_container_width=True):
-                        conn = get_connection()
-                        c = conn.cursor()
-                        count = 0
-                        for _, r in df_gsheet.iterrows():
-                            if pd.notna(r["name"]):
-                                c.execute("""
-                                    INSERT INTO inventory (name, category, price, mrp, selling_price, stock)
-                                    VALUES (?, ?, ?, ?, ?, ?)
-                                    ON CONFLICT(name) DO UPDATE SET
-                                        category = excluded.category,
-                                        price = excluded.price,
-                                        mrp = excluded.mrp,
-                                        selling_price = excluded.selling_price,
-                                        stock = excluded.stock
-                                """, (
-                                    str(r["name"]).strip().title(),
-                                    str(r.get("category", "General Goods")).strip(),
-                                    float(r.get("selling_price", 0.0)),
-                                    float(r.get("mrp", 0.0)),
-                                    float(r.get("selling_price", 0.0)),
-                                    int(r.get("stock", 0))
-                                ))
-                                count += 1
-                        conn.commit()
-                        conn.close()
-                        st.success(f"{count} items database me sync aur update ho gaye!")
-                else:
-                    st.error(f"Columns missing hain! Sheet me ye columns hone chahiye: {list(required_cols)}")
-            except Exception as e:
-                st.error(f"Google Sheet fetch karne me error: {e}")
+        st.markdown(f"**Connected Sheet:** [Google Sheet Link]({GSHEET_URL})")
+        
+        # Immediate refresh if user wants instant bypass of cache
+        if st.button("🔄 Force Refresh Now", type="secondary"):
+            st.cache_data.clear()
+            success, msg = auto_sync_google_sheet()
+            if success:
+                st.success("Live data Google Sheet se update ho gaya!")
+            else:
+                st.error(f"Sync error: {msg}")
+
+        # Current Google Sheet Live Preview
+        try:
+            preview_df = fetch_gsheet_df(GSHEET_URL)
+            st.dataframe(preview_df, use_container_width=True)
+        except Exception as e:
+            st.error(f"Preview error: {e}")
 
     with tab_manual:
         with st.form("manual_form", clear_on_submit=True):
@@ -576,7 +589,7 @@ elif menu == "📦 Inventory Management":
 
 # ----------------- MODULE 3: SALES HISTORY -----------------
 elif menu == "📊 Sales & Reports":
-    st.title("📊 Sales Report & History")
+    st.title("📊 Permanent Sales Report")
     conn = get_connection()
     df_sales = pd.read_sql("SELECT bill_no as 'Bill ID', customer_name as 'Customer', items_summary as 'Items', total_amount as 'Total (Rs.)', bill_date as 'Date' FROM sales ORDER BY bill_no DESC", conn)
     conn.close()
@@ -587,12 +600,11 @@ elif menu == "📊 Sales & Reports":
         col_m2.metric("Total Bills Generated", len(df_sales))
         st.dataframe(df_sales, use_container_width=True)
         
-        # Download Complete Sales Report
         csv = df_sales.to_csv(index=False).encode('utf-8')
         st.download_button(
-            label="📥 Download Sales Report (CSV)",
+            label="📥 Download All Sales History (CSV)",
             data=csv,
-            file_name="Sourya_Stationery_Sales_Report.csv",
+            file_name="Sourya_Stationery_Complete_Sales.csv",
             mime="text/csv"
         )
     else:
