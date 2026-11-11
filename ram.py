@@ -4,6 +4,7 @@ import pandas as pd
 from datetime import datetime
 import io
 import re
+import json
 from fpdf import FPDF
 
 # 1. Page Configuration (Mobile & Desktop Responsive)
@@ -49,6 +50,7 @@ def init_db():
         )
     """)
     
+    # Auto-migration for inventory
     c.execute("PRAGMA table_info(inventory)")
     cols = [column[1] for column in c.fetchall()]
     
@@ -65,6 +67,7 @@ def init_db():
         c.execute("ALTER TABLE inventory ADD COLUMN price REAL DEFAULT 0")
         c.execute("UPDATE inventory SET price = selling_price")
 
+    # Sales Table with items_json for permanent bill printing
     c.execute("""
         CREATE TABLE IF NOT EXISTS sales (
             bill_no INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,15 +76,23 @@ def init_db():
             subtotal REAL,
             discount REAL,
             total_amount REAL,
-            bill_date TEXT
+            bill_date TEXT,
+            items_json TEXT
         )
     """)
+    
+    # Check if items_json exists in sales
+    c.execute("PRAGMA table_info(sales)")
+    sales_cols = [column[1] for column in c.fetchall()]
+    if "items_json" not in sales_cols:
+        c.execute("ALTER TABLE sales ADD COLUMN items_json TEXT")
+
     conn.commit()
     conn.close()
 
 init_db()
 
-# Helper: Google Sheet URL ko CSV Export URL me badalna
+# Helper: Google Sheet URL converter
 def get_gsheet_csv_url(sheet_url):
     match = re.search(r"/d/([a-zA-Z0-9-_]+)", sheet_url)
     if match:
@@ -89,28 +100,56 @@ def get_gsheet_csv_url(sheet_url):
         return f"https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv"
     return sheet_url
 
-# 3. PDF Generator: A4 Landscape par 2 Bills Side-by-Side (Bilingual Hindi/English Memo)
+# Helper: Database se Bill Fetch karna (Reload hone par bhi bill na khoye)
+def get_bill_from_db(bill_id=None):
+    conn = get_connection()
+    c = conn.cursor()
+    if bill_id:
+        c.execute("SELECT bill_no, customer_name, bill_date, subtotal, discount, total_amount, items_json FROM sales WHERE bill_no = ?", (bill_id,))
+    else:
+        # Aakhri generate hua bill
+        c.execute("SELECT bill_no, customer_name, bill_date, subtotal, discount, total_amount, items_json FROM sales ORDER BY bill_no DESC LIMIT 1")
+    row = c.fetchone()
+    conn.close()
+    
+    if row:
+        items = []
+        if row[6]:
+            try:
+                items = json.loads(row[6])
+            except Exception:
+                items = []
+        return {
+            "bill_no": row[0],
+            "customer": row[1],
+            "date": row[2],
+            "subtotal": float(row[3] or 0.0),
+            "discount": float(row[4] or 0.0),
+            "total": float(row[5] or 0.0),
+            "items": items
+        }
+    return None
+
+# 3. PDF Generator: A4 Landscape 2 Bills Side-by-Side
 def build_side_by_side_pdf(bill_data):
-    # A4 Landscape: Width = 297mm, Height = 210mm
     pdf = FPDF(orientation='L', unit='mm', format='A4')
     pdf.set_auto_page_break(auto=False)
     pdf.add_page()
 
-    # Draw vertical separator line between two halves
+    # Center Separator
     pdf.set_draw_color(180, 180, 180)
     pdf.line(148.5, 5, 148.5, 205)
 
     def draw_single_bill(x_offset, copy_type):
-        w = 136  # Width of bill box
-        h = 195  # Height of bill box
+        w = 136
+        h = 195
         y_top = 8
 
-        # Outer Border Box
         pdf.set_draw_color(0, 0, 0)
         pdf.set_line_width(0.3)
         pdf.rect(x_offset, y_top, w, h)
 
-        # Header 1: Proprietor & Mobile
+        # Header 1
         pdf.set_xy(x_offset + 3, y_top + 2)
         pdf.set_font("Helvetica", "B", 7.5)
         pdf.cell(50, 4, "Prop: Shriram Chandravanshi", 0, 0, "L")
@@ -122,7 +161,7 @@ def build_side_by_side_pdf(bill_data):
         pdf.set_font("Helvetica", "B", 13)
         pdf.cell(w, 6, "SOURYA STATIONERY & SPORTS", 0, 1, "C")
 
-        # Sub-title & Category
+        # Sub-title
         pdf.set_x(x_offset)
         pdf.set_font("Helvetica", "", 7.5)
         pdf.cell(w, 4, "School, College, Office Stationery, Sports Goods, Gifts & General Items", 0, 1, "C")
@@ -132,7 +171,7 @@ def build_side_by_side_pdf(bill_data):
         pdf.set_font("Helvetica", "B", 8)
         pdf.cell(w, 4.5, "Talkies Road, Ward No. 5, Sihora, Jabalpur (M.P.)", 1, 1, "C")
 
-        # Bill Meta Info
+        # Meta Info
         pdf.ln(1)
         curr_y = pdf.get_y()
         pdf.set_xy(x_offset + 3, curr_y)
@@ -146,7 +185,7 @@ def build_side_by_side_pdf(bill_data):
         pdf.set_font("Helvetica", "", 8)
         pdf.cell(27, 5, f"{bill_data['date']}", 0, 1, "R")
 
-        # Customer Details
+        # Customer
         pdf.set_x(x_offset + 3)
         pdf.set_font("Helvetica", "B", 8)
         pdf.cell(20, 5, "Shreeman:", 0, 0)
@@ -157,11 +196,7 @@ def build_side_by_side_pdf(bill_data):
         pdf.ln(2)
         table_y = pdf.get_y()
         pdf.set_xy(x_offset + 2, table_y)
-        col_sno = 10
-        col_desc = 64
-        col_qty = 18
-        col_rate = 20
-        col_amt = 20
+        col_sno, col_desc, col_qty, col_rate, col_amt = 10, 64, 18, 20, 20
 
         pdf.set_font("Helvetica", "B", 8)
         pdf.cell(col_sno, 6, "S.N.", 1, 0, "C")
@@ -170,7 +205,7 @@ def build_side_by_side_pdf(bill_data):
         pdf.cell(col_rate, 6, "Rate (Rs)", 1, 0, "C")
         pdf.cell(col_amt, 6, "Amount", 1, 1, "C")
 
-        # Item Rows Area
+        # Items Rows
         row_start_y = pdf.get_y()
         max_rows = 11
         row_height = 7
@@ -200,11 +235,9 @@ def build_side_by_side_pdf(bill_data):
                 pdf.cell(col_amt, row_height, "", "LR", 1, "R")
 
         bottom_y = row_start_y + total_table_height
-
-        # Bottom Border of Items
         pdf.line(x_offset + 2, bottom_y, x_offset + 2 + w - 4, bottom_y)
 
-        # Discount row if applicable
+        # Discount
         if bill_data.get('discount', 0) > 0:
             pdf.set_xy(x_offset + 2, bottom_y)
             pdf.set_font("Helvetica", "", 7.5)
@@ -212,13 +245,13 @@ def build_side_by_side_pdf(bill_data):
             pdf.cell(col_rate + col_amt, 5, f"- Rs. {bill_data['discount']:.2f} ", 1, 1, "R")
             bottom_y += 5
 
-        # Grand Total / Kul Yog
+        # Grand Total
         pdf.set_xy(x_offset + 2, bottom_y)
         pdf.set_font("Helvetica", "B", 9)
         pdf.cell(col_sno + col_desc + col_qty, 7, "KUL YOG / GRAND TOTAL:", 1, 0, "R")
         pdf.cell(col_rate + col_amt, 7, f"Rs. {bill_data['total']:.2f} ", 1, 1, "R")
 
-        # Footer Signature
+        # Signatures
         pdf.set_xy(x_offset + 4, y_top + h - 14)
         pdf.set_font("Helvetica", "I", 7)
         pdf.cell(60, 4, "* Goods once sold will not be taken back", 0, 0, "L")
@@ -229,7 +262,6 @@ def build_side_by_side_pdf(bill_data):
         pdf.cell(60, 4, "Thank you! Please visit again.", 0, 0, "L")
         pdf.cell(68, 4, "(Authorized Signatory)", 0, 1, "R")
 
-    # Render Left Bill (Customer Copy) & Right Bill (Shop Copy)
     draw_single_bill(6, "CUSTOMER COPY")
     draw_single_bill(154, "SHOP COPY")
 
@@ -238,8 +270,6 @@ def build_side_by_side_pdf(bill_data):
 # 4. Session State Setup
 if "cart" not in st.session_state:
     st.session_state.cart = []
-if "last_bill" not in st.session_state:
-    st.session_state.last_bill = None
 
 # Sidebar Navigation
 st.sidebar.markdown("## 📚 Sourya Stationery")
@@ -292,7 +322,7 @@ if menu == "🧾 New Bill / POS":
                     })
                     st.success(f"Added {selected_item}")
         else:
-            st.warning("Inventory me stock uplabdh nahi hai. Kripya naye items add karein.")
+            st.warning("Inventory me stock uplabdh nahi hai. Kripya pehle inventory sync karein.")
 
     with col_cart:
         st.subheader("Cart & Checkout")
@@ -316,29 +346,21 @@ if menu == "🧾 New Bill / POS":
                     
                     items_summary = ", ".join([f"{i['Item']} ({i['Quantity']}x)" for i in st.session_state.cart])
                     bill_time = datetime.now().strftime("%d-%m-%Y %I:%M %p")
+                    items_json_str = json.dumps(st.session_state.cart)
 
                     for item in st.session_state.cart:
                         c.execute("UPDATE inventory SET stock = stock - ? WHERE name = ?", (item["Quantity"], item["Item"]))
 
                     c.execute("""
-                        INSERT INTO sales (customer_name, items_summary, subtotal, discount, total_amount, bill_date)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (cust_name, items_summary, subtotal, discount_val, final_total, bill_time))
+                        INSERT INTO sales (customer_name, items_summary, subtotal, discount, total_amount, bill_date, items_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (cust_name, items_summary, subtotal, discount_val, final_total, bill_time, items_json_str))
                     
-                    bill_id = c.lastrowid
                     conn.commit()
                     conn.close()
 
-                    st.session_state.last_bill = {
-                        "bill_no": bill_id,
-                        "customer": cust_name,
-                        "date": bill_time,
-                        "items": list(st.session_state.cart),
-                        "subtotal": subtotal,
-                        "discount": discount_val,
-                        "total": final_total
-                    }
                     st.session_state.cart = []
+                    st.success("Bill permanently save ho gaya!")
                     st.rerun()
 
             with btn_col2:
@@ -348,21 +370,41 @@ if menu == "🧾 New Bill / POS":
         else:
             st.info("Cart khali hai.")
 
-    # Bill View & PDF Download Section
-    if st.session_state.last_bill:
-        b = st.session_state.last_bill
+    # ---------------- BILL VIEW & REPRINT SECTION ----------------
+    # Reload hone par bhi SQLite database se latest bill hamesha screen par available rahega
+    active_bill = get_bill_from_db()
+    
+    if active_bill and active_bill['items']:
         st.markdown("---")
-        st.subheader(f"🧾 Bill #{b['bill_no']} - Ready to Print (2-in-1 Side-by-Side Memo)")
-
-        pdf_bytes = build_side_by_side_pdf(b)
+        b_col1, b_col2 = st.columns([2, 1])
         
-        st.download_button(
-            label="📄 Download Side-by-Side Dual Bill (PDF)",
-            data=pdf_bytes,
-            file_name=f"Sourya_Stationery_Dual_Bill_{b['bill_no']}.pdf",
-            mime="application/pdf",
-            use_container_width=True
-        )
+        with b_col1:
+            st.subheader(f"🧾 Last Generated Bill: #{active_bill['bill_no']} ({active_bill['customer']})")
+            st.caption(f"Date: {active_bill['date']} | Total Amount: Rs. {active_bill['total']:.2f}")
+
+        with b_col2:
+            # Agar koi aur purana bill reprint karna ho
+            conn = get_connection()
+            all_bills = pd.read_sql("SELECT bill_no, customer_name FROM sales ORDER BY bill_no DESC LIMIT 20", conn)
+            conn.close()
+            
+            if not all_bills.empty:
+                bill_options = {f"Bill #{r['bill_no']} - {r['customer_name']}": r['bill_no'] for _, r in all_bills.iterrows()}
+                selected_label = st.selectbox("Purana Bill Reprint Karein:", list(bill_options.keys()))
+                chosen_id = bill_options[selected_label]
+                if chosen_id != active_bill['bill_no']:
+                    active_bill = get_bill_from_db(chosen_id)
+
+        # PDF download button
+        if active_bill and active_bill.get('items'):
+            pdf_bytes = build_side_by_side_pdf(active_bill)
+            st.download_button(
+                label=f"📄 Download Dual Bill #{active_bill['bill_no']} (PDF)",
+                data=pdf_bytes,
+                file_name=f"Sourya_Stationery_Dual_Bill_{active_bill['bill_no']}.pdf",
+                mime="application/pdf",
+                use_container_width=True
+            )
 
 # ----------------- MODULE 2: INVENTORY -----------------
 elif menu == "📦 Inventory Management":
@@ -372,15 +414,12 @@ elif menu == "📦 Inventory Management":
         "🌐 Google Sheet Sync", "➕ Manual Entry", "📂 Excel Bulk Upload", "📋 Stock List"
     ])
 
-    # Google Sheets Tab
     with tab_gsheet:
         st.subheader("🌐 Sync Inventory from Google Sheets")
         default_sheet_url = "https://docs.google.com/spreadsheets/d/1rHEQ8o7u3mvGxh5VJuyJ9EU4-h9TH2Abx4niXByBHV4/edit?usp=sharing"
         sheet_url_input = st.text_input("Google Sheet Share Link", value=default_sheet_url)
         
-        col_s1, col_s2 = st.columns([1, 1])
-        with col_s1:
-            load_btn = st.button("🔄 Fetch / Reload from Google Sheets", type="primary", use_container_width=True)
+        load_btn = st.button("🔄 Fetch / Reload from Google Sheets", type="primary", use_container_width=True)
             
         if load_btn or ("gsheet_cache_df" in st.session_state):
             try:
@@ -389,7 +428,7 @@ elif menu == "📦 Inventory Management":
                 df_gsheet.columns = [str(c).strip().lower() for c in df_gsheet.columns]
                 st.session_state.gsheet_cache_df = df_gsheet
                 
-                st.success("Google Sheet se live data successfully fetch ho gaya!")
+                st.success("Google Sheet se live data fetch ho gaya!")
                 st.dataframe(df_gsheet, use_container_width=True)
                 
                 required_cols = {"name", "category", "mrp", "selling_price", "stock"}
@@ -425,7 +464,6 @@ elif menu == "📦 Inventory Management":
                     st.error(f"Columns missing hain! Sheet me ye columns hone chahiye: {list(required_cols)}")
             except Exception as e:
                 st.error(f"Google Sheet fetch karne me error: {e}")
-                st.info("Kripya ensure karein ki Google Sheet ki Sharing setting 'Anyone with the link can view' ho.")
 
     with tab_manual:
         with st.form("manual_form", clear_on_submit=True):
@@ -467,8 +505,6 @@ elif menu == "📦 Inventory Management":
 
     with tab_excel:
         st.subheader("Bulk Stock Upload (Excel / CSV)")
-        st.write("Columns: `name`, `category`, `mrp`, `selling_price`, `stock`")
-        
         sample_df = pd.DataFrame([
             {"name": "Classmate Notebook", "category": "Notebooks & Registers", "mrp": 60.0, "selling_price": 55.0, "stock": 50},
             {"name": "Reynolds Ball Pen Blue", "category": "Pens, Pencils & Erasers", "mrp": 10.0, "selling_price": 10.0, "stock": 100}
@@ -540,7 +576,7 @@ elif menu == "📦 Inventory Management":
 
 # ----------------- MODULE 3: SALES HISTORY -----------------
 elif menu == "📊 Sales & Reports":
-    st.title("📊 Sales Report")
+    st.title("📊 Sales Report & History")
     conn = get_connection()
     df_sales = pd.read_sql("SELECT bill_no as 'Bill ID', customer_name as 'Customer', items_summary as 'Items', total_amount as 'Total (Rs.)', bill_date as 'Date' FROM sales ORDER BY bill_no DESC", conn)
     conn.close()
@@ -548,7 +584,16 @@ elif menu == "📊 Sales & Reports":
     if not df_sales.empty:
         col_m1, col_m2 = st.columns(2)
         col_m1.metric("Total Revenue", f"Rs. {df_sales['Total (Rs.)'].sum():.2f}")
-        col_m2.metric("Total Bills Cut", len(df_sales))
+        col_m2.metric("Total Bills Generated", len(df_sales))
         st.dataframe(df_sales, use_container_width=True)
+        
+        # Download Complete Sales Report
+        csv = df_sales.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 Download Sales Report (CSV)",
+            data=csv,
+            file_name="Sourya_Stationery_Sales_Report.csv",
+            mime="text/csv"
+        )
     else:
         st.info("Abhi tak koi bill generate nahi hua hai.")
